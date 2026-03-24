@@ -1,5 +1,5 @@
-from gui import PDFFusionGUI
+from gui import PDFMangaGUI
 
 if __name__ == "__main__":
-    app = PDFFusionGUI()
+    app = PDFMangaGUI()
     app.mainloop()

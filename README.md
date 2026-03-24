@@ -13,4 +13,4 @@ Assicurati di avere Python 3.8 o superiore installato sul tuo sistema.
 3. Installa le dipendenze necessarie eseguendo:
 
 ```bash
-pip install customtkinter pypdf CTkMessagebox tkinterdnd2
+pip install customtkinter tkinterdnd2 CTkMessagebox PyMuPDF
