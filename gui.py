@@ -20,25 +20,26 @@ class PDFMangaGUI(ctk.CTk, TkinterDnD.DnDWrapper):
         self.crea_widget()
 
     def _inizializza_tkdnd(self):
-        """Risolve il mismatch 32/64 bit caricando i binari corretti."""
+        """Inizializzazione intelligente basata sul Sistema Operativo."""
         try:
             import tkinterdnd2
             base_dir = os.path.dirname(tkinterdnd2.__file__)
+            sistema = platform.system()
+
+            if sistema == "Windows":
+                is_64bit = sys.maxsize > 2**32
+                arch_dir = "win-x64" if is_64bit else "win-x86"
+                tkdnd_binaries = os.path.join(base_dir, 'tkdnd', arch_dir)
+                if os.path.exists(tkdnd_binaries):
+                    self.tk.call('lappend', 'auto_path', tkdnd_binaries)
             
-            # Determiniamo se Python è a 64 o 32 bit
-            is_64bit = sys.maxsize > 2**32
-            arch_dir = "win-x64" if is_64bit else "win-x86"
+            # Su Linux e Mac, solitamente tkinterdnd2 trova i binari da solo 
+            # se sono installati correttamente o inclusi nel wheel.
+            self.tk.call('package', 'require', 'tkdnd')
             
-            # Costruiamo il percorso assoluto ai binari corretti
-            tkdnd_binaries = os.path.join(base_dir, 'tkdnd', arch_dir)
-            
-            if os.path.exists(tkdnd_binaries):
-                self.tk.call('lappend', 'auto_path', tkdnd_binaries)
-                self.tk.call('package', 'require', 'tkdnd')
-            else:
-                print(f"DEBUG: Percorso binari non trovato: {tkdnd_binaries}")
         except Exception as e:
-            print(f"CRITICAL: Fallimento inizializzazione TkDnD: {e}")
+            print(f"SISTEMA: {platform.system()} | Errore DND: {e}")
+            # Non blocchiamo l'avvio: il programma funzionerà senza Drag & Drop
 
     def crea_widget(self):
         # Titolo Header
