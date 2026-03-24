@@ -2,7 +2,7 @@ import customtkinter as ctk
 from tkinterdnd2 import DND_FILES, TkinterDnD
 from CTkMessagebox import CTkMessagebox
 from logic import elabora_documento
-import os, fitz, sys
+import os, fitz, sys, re
 
 class PDFItem(ctk.CTkFrame):
     def __init__(self, master, file_path, on_remove, on_move_up, on_move_down):
@@ -199,3 +199,107 @@ class PDFPageMergerGUI(ctk.CTk, TkinterDnD.DnDWrapper):
         finally: 
             self.progress_bar.pack_forget()
             self.btn_avvia.configure(state="normal")
+            
+class ExclusionDialog(ctk.CTkToplevel):
+    def __init__(self, master, current_exclusions, max_pagine):
+        super().__init__(master)
+        self.title("Escludi Pagine")
+        self.geometry("400x250")
+        self.max_pagine = max_pagine
+        self.result = current_exclusions
+        
+        self.label = ctk.CTkLabel(self, text="Inserisci pagine o intervalli da ESCLUDERE\n(es: 1, 3-5, 10)", font=("Roboto", 13))
+        self.label.pack(pady=20)
+        
+        self.entry = ctk.CTkEntry(self, width=300)
+        self.entry.insert(0, current_exclusions)
+        self.entry.pack(pady=10)
+        
+        self.btn_confirm = ctk.CTkButton(self, text="Conferma", command=self.confirm)
+        self.btn_confirm.pack(pady=20)
+        
+        self.transient(master)
+        self.grab_set()
+
+    def confirm(self):
+        self.result = self.entry.get()
+        self.destroy()
+
+class PDFItem(ctk.CTkFrame):
+    def __init__(self, master, file_path, on_remove, on_move_up, on_move_down):
+        super().__init__(master)
+        self.file_path = file_path
+        self.exclusions = "" # Stringa salvata per l'utente
+        
+        doc = fitz.open(file_path)
+        self.max_pagine = len(doc)
+        doc.close()
+
+        is_single = self.max_pagine <= 1
+        slider_to, steps = (1.1, 1) if is_single else (self.max_pagine, self.max_pagine - 1)
+
+        # --- Header ---
+        self.header = ctk.CTkFrame(self, fg_color="transparent")
+        self.header.pack(fill="x", padx=10, pady=(5, 0))
+        
+        ctk.CTkLabel(self.header, text=os.path.basename(file_path), 
+                     font=("Roboto", 12, "bold"), text_color="#2ecc71").pack(side="left")
+        
+        # Bottoni
+        ctk.CTkButton(self.header, text="X", width=25, height=20, fg_color="#C0392B", command=lambda: on_remove(self)).pack(side="right", padx=2)
+        ctk.CTkButton(self.header, text="▼", width=25, height=20, fg_color="#34495E", command=lambda: on_move_down(self)).pack(side="right", padx=2)
+        ctk.CTkButton(self.header, text="▲", width=25, height=20, fg_color="#34495E", command=lambda: on_move_up(self)).pack(side="right", padx=2)
+        
+        # Tasto tre puntini per esclusioni
+        self.btn_dots = ctk.CTkButton(self.header, text="...", width=30, height=20, fg_color="#5D6D7E", command=self.open_exclusion_dialog)
+        self.btn_dots.pack(side="right", padx=5)
+
+        # --- Slider ---
+        self.label_s = ctk.CTkLabel(self, text="Inizio: 1", font=("Roboto", 13, "bold"))
+        self.label_s.pack(padx=20, anchor="w")
+        self.slider_s = ctk.CTkSlider(self, from_=1, to=slider_to, number_of_steps=steps, height=18, command=self.update_labels)
+        self.slider_s.set(1); self.slider_s.pack(fill="x", padx=20)
+
+        self.label_e = ctk.CTkLabel(self, text=f"Fine: {self.max_pagine}", font=("Roboto", 13, "bold"))
+        self.label_e.pack(padx=20, anchor="w")
+        self.slider_e = ctk.CTkSlider(self, from_=1, to=slider_to, number_of_steps=steps, height=18, command=self.update_labels)
+        self.slider_e.set(self.max_pagine); self.slider_e.pack(fill="x", padx=20, pady=(0, 10))
+
+        if is_single:
+            self.slider_s.configure(state="disabled"); self.slider_e.configure(state="disabled")
+
+    def open_exclusion_dialog(self):
+        dialog = ExclusionDialog(self.winfo_toplevel(), self.exclusions, self.max_pagine)
+        self.master.wait_window(dialog)
+        self.exclusions = dialog.result
+        if self.exclusions.strip():
+            self.btn_dots.configure(fg_color="#F39C12") # Cambia colore se ci sono esclusioni
+        else:
+            self.btn_dots.configure(fg_color="#5D6D7E")
+
+    def parse_exclusions(self):
+        """Converte la stringa '1, 3-5' in un set di indici (0-based)."""
+        excluded_indices = set()
+        parts = re.split(r'[,\s]+', self.exclusions)
+        for part in parts:
+            if '-' in part:
+                try:
+                    start, end = map(int, part.split('-'))
+                    excluded_indices.update(range(start-1, end))
+                except: pass
+            elif part.isdigit():
+                excluded_indices.add(int(part)-1)
+        return excluded_indices
+
+    def update_labels(self, _=None):
+        s, e = int(self.slider_s.get()), int(self.slider_e.get())
+        if s > e: self.slider_s.set(e); s = e
+        self.label_s.configure(text=f"Inizio: {s}"); self.label_e.configure(text=f"Fine: {e}")
+
+    def get_data(self):
+        return {
+            "path": self.file_path, 
+            "start": int(self.slider_s.get()) - 1, 
+            "end": int(self.slider_e.get()),
+            "exclude": self.parse_exclusions()
+        }
