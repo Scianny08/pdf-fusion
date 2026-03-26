@@ -26,6 +26,7 @@ from logic import elabora_documento, get_documents_path, COMPRESS_PRESETS
 from PIL import Image
 import os, fitz, sys, re, platform, io, subprocess
 from pathlib import Path
+import ctypes
 
 
 # ============================================================
@@ -892,6 +893,60 @@ class PDFPageMergerGUI(ctk.CTk, TkinterDnD.DnDWrapper):
         self.title("PDF Page Merger")
         self.geometry("760x730")
         self.minsize(580, 520)
+
+        # Icon
+        try:
+            icon_path = Path(__file__).parent / "icon.png"
+            if icon_path.exists():
+                icon_img = Image.open(icon_path)
+                system = platform.system()
+
+                if system == "Windows":
+                    
+                    ico_path = Path(__file__).parent / "icon.ico"
+                    if ico_path.exists():
+                        # Imposta un AppUserModelID univoco — necessario per la taskbar
+                        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                            "PDFPageMerger.App"
+                        )
+                        self.iconbitmap(str(ico_path))
+                        # Forza l'icona grande (32x32) e piccola (16x16) nella taskbar
+                        WM_SETICON = 0x0080
+                        ICON_SMALL = 0
+                        ICON_BIG   = 1
+                        icon_handle = ctypes.windll.user32.LoadImageW(
+                            None, str(ico_path), 1,  # IMAGE_ICON = 1
+                            0, 0,
+                            0x00000010 | 0x00000040,  # LR_LOADFROMFILE | LR_DEFAULTSIZE
+                        )
+                        hwnd = ctypes.windll.user32.GetForegroundWindow()
+                        ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG,   icon_handle)
+                        ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, icon_handle)
+                    else:
+                        from PIL import ImageTk
+                        self._tk_icon = ImageTk.PhotoImage(icon_img.resize((64, 64)))
+                        self.iconphoto(True, self._tk_icon)
+
+                elif system == "Darwin":
+                    icns_path = Path(__file__).parent / "icon.icns"
+                    if icns_path.exists():
+                        # macOS: usa osascript per impostare l'icona del dock
+                        subprocess.Popen([
+                            "osascript", "-e",
+                            f'tell application "System Events" to set the icon of process "Python" to POSIX file "{icns_path}"'
+                        ])
+                    # iconphoto funziona comunque come fallback nella titlebar
+                    from PIL import ImageTk
+                    self._tk_icon = ImageTk.PhotoImage(icon_img.resize((64, 64)))
+                    self.iconphoto(True, self._tk_icon)
+
+                else:  # Linux
+                    from PIL import ImageTk
+                    self._tk_icon = ImageTk.PhotoImage(icon_img.resize((64, 64)))
+                    self.iconphoto(True, self._tk_icon)
+
+        except Exception:
+            pass  # Non-fatal
 
         # ---- application state ----
         self.items:          list = []
