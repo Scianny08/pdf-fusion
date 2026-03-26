@@ -22,7 +22,7 @@ No `break` statements are used anywhere in this module.
 import customtkinter as ctk
 from tkinterdnd2 import DND_FILES, TkinterDnD
 from CTkMessagebox import CTkMessagebox
-from src.logic import elabora_documento, get_documents_path, COMPRESS_PRESETS
+from logic import elabora_documento, get_documents_path, COMPRESS_PRESETS
 from PIL import Image
 import os, fitz, sys, re, platform, io, subprocess
 from pathlib import Path
