@@ -5,7 +5,6 @@ main.py — Application entry point for PDF Page Merger.
 import traceback
 from gui import PDFPageMergerGUI
 
-
 def main() -> None:
     try:
         print("Starting PDF Page Merger...")
