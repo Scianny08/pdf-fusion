@@ -254,26 +254,33 @@ class PreviewDialog(ctk.CTkToplevel):
     - The PDF document is opened once and kept open until the dialog
       is destroyed.
     - Spreads are computed up-front in `_build_spread_list`; pages are
-      rendered on-demand in `_render_spread` to keep memory usage low.
+      rendered on-demand in `_show_spread` to keep memory usage low.
+    - Pages are rendered at _RENDER_SCALE then PIL-scaled to fit the
+      available label area so the preview adapts to any window size,
+      including live resize.
     - No `break` statements are used.
     """
 
-    # Render scale: 0.20 keeps thumbnails crisp but not huge
-    _SCALE = 0.20
+    # Render pages at 1.5× (≈108 DPI) for good quality before downscaling.
+    # Much higher than the old 0.20 (14 DPI), so text and lines stay sharp.
+    _RENDER_SCALE = 1.5
 
     def __init__(self, master, item_data: dict, manga_mode: bool):
         super().__init__(master)
         self.title("Merge Preview")
         self.resizable(True, True)
         self.transient(master)
-        self.grab_set()
+
+        self.geometry("860x640")
+        self.minsize(600, 480)
 
         # ---- internal state ----
-        self._doc:         "fitz.Document | None" = None
-        self._manga_mode:  bool                   = manga_mode
-        self._spreads:     list                   = []  # list of (a, b|None)
-        self._current:     int                    = 0
-        self._image_ref                           = None  # GC guard
+        self._doc:             "fitz.Document | None" = None
+        self._manga_mode:      bool                   = manga_mode
+        self._spreads:         list                   = []   # list of (a, b|None)
+        self._current:         int                    = 0
+        self._image_ref                               = None  # GC guard
+        self._resize_after_id: "str | None"           = None  # debounce handle
 
         # ---- build content ----
         self._build_spread_list(item_data)
@@ -288,9 +295,13 @@ class PreviewDialog(ctk.CTkToplevel):
         self.bind("<Button-4>",   self._on_wheel)   # Linux scroll up
         self.bind("<Button-5>",   self._on_wheel)   # Linux scroll down
 
-        # Show the first spread (or the empty-state message)
+        # Defer grab_set() and the first render until the window is fully
+        # realized by the WM.  This prevents grab failures on Linux
+        # compositors and ensures winfo_width/height() return real values
+        # (not 1) when _fit_image() queries the label dimensions.
         if self._spreads:
-            self._show_spread(0)
+            self.after(80, lambda: self._show_spread(0))
+        self.after(80, self.grab_set)
 
     # ------------------------------------------------------------------
     # Spread list construction
@@ -307,15 +318,15 @@ class PreviewDialog(ctk.CTkToplevel):
         keep_single pages are present but act as pairing barriers:
         they are never paired with the page before or after them.
         """
-        cover_alone:  bool = data.get("cover_alone", False)
-        start:        int  = data["start"]
-        end:          int  = data["end"]
-        excluded:     set  = data["exclude"]
-        keep_single:  set  = data.get("keep_single", set())
+        cover_alone: bool = data.get("cover_alone", False)
+        start:       int  = data["start"]
+        end:         int  = data["end"]
+        excluded:    set  = data["exclude"]
+        keep_single: set  = data.get("keep_single", set())
 
         try:
-            self._doc  = fitz.open(data["path"])
-            n          = len(self._doc)
+            self._doc   = fitz.open(data["path"])
+            n           = len(self._doc)
             range_start = start
 
             # 1. Cover page
@@ -336,7 +347,7 @@ class PreviewDialog(ctk.CTkToplevel):
             ]
             pair_idx = 0
             while pair_idx < len(valid):
-                left  = valid[pair_idx]
+                left            = valid[pair_idx]
                 left_is_single  = left in keep_single
 
                 has_right       = pair_idx + 1 < len(valid)
@@ -365,7 +376,16 @@ class PreviewDialog(ctk.CTkToplevel):
     # ------------------------------------------------------------------
 
     def _build_ui(self) -> None:
-        """Create the dialog layout: image area, info label, nav bar."""
+        """
+        Create the dialog layout.
+
+        CRITICAL pack ordering: with the pack geometry manager, widgets
+        anchored to the bottom (nav bar, info label) MUST be packed
+        before the fill="both" expand=True image widget.  If the image
+        label is packed first it claims all vertical space and pushes
+        subsequent bottom-anchored widgets off-screen — making navigation
+        impossible.
+        """
 
         # -- Error state ------------------------------------------------
         if hasattr(self, "_build_error"):
@@ -375,7 +395,6 @@ class PreviewDialog(ctk.CTkToplevel):
                 font=("Roboto", 12),
                 text_color="#E74C3C",
             ).pack(padx=20, pady=30)
-            self.geometry("440x130")
             return
 
         if not self._spreads:
@@ -384,23 +403,11 @@ class PreviewDialog(ctk.CTkToplevel):
                 text="No pages in the selected range.",
                 font=("Roboto", 13),
             ).pack(padx=20, pady=30)
-            self.geometry("380x100")
             return
 
-        # -- Image display (updated on navigation) ----------------------
-        self._image_label = ctk.CTkLabel(self, text="Loading preview…")
-        self._image_label.pack(padx=10, pady=(10, 4))
-
-        # -- Spread info label ------------------------------------------
-        self._info_label = ctk.CTkLabel(
-            self, text="",
-            font=("Roboto", 11), text_color="#95A5A6",
-        )
-        self._info_label.pack(pady=(0, 4))
-
-        # -- Navigation bar ---------------------------------------------
+        # -- Navigation bar (packed FIRST → anchors to bottom) ----------
         nav = ctk.CTkFrame(self, fg_color="transparent")
-        nav.pack(pady=(0, 12))
+        nav.pack(side="bottom", pady=(0, 12))
 
         self._btn_prev = ctk.CTkButton(
             nav, text="◀  Prev", width=96, height=30,
@@ -423,6 +430,24 @@ class PreviewDialog(ctk.CTkToplevel):
         )
         self._btn_next.pack(side="left", padx=6)
 
+        # -- Spread info label (above nav, still bottom-anchored) -------
+        self._info_label = ctk.CTkLabel(
+            self, text="",
+            font=("Roboto", 11), text_color="#95A5A6",
+        )
+        self._info_label.pack(side="bottom", pady=(0, 4))
+
+        # -- Image display (fills ALL remaining space) ------------------
+        # Packed last so it expands into the space left by the two
+        # bottom-anchored widgets above.
+        self._image_label = ctk.CTkLabel(self, text="Loading preview…")
+        self._image_label.pack(
+            side="top", fill="both", expand=True, padx=10, pady=(10, 4)
+        )
+
+        # -- Live-resize: debounced re-render on window resize ----------
+        self.bind("<Configure>", self._on_resize)
+
     # ------------------------------------------------------------------
     # Navigation
     # ------------------------------------------------------------------
@@ -437,11 +462,62 @@ class PreviewDialog(ctk.CTkToplevel):
 
     def _on_wheel(self, event) -> None:
         """Translate scroll-wheel events into spread navigation."""
-        if event.delta != 0:
-            direction = 1 if event.delta < 0 else -1   # scroll down = next
-        else:
-            direction = 1 if event.num == 5 else -1    # Button-5 = scroll down
+        direction = (1 if event.delta < 0 else -1) if event.delta != 0 \
+                    else (1 if event.num == 5 else -1)
         self._navigate(direction)
+
+    def _on_resize(self, event) -> None:
+        """
+        Debounced handler: re-render the current spread after the window
+        has been resized.  Fires only for the toplevel itself (not child
+        widgets) and waits 150 ms of quiet to avoid flooding fitz with
+        render requests during a live drag-resize.
+        """
+        if event.widget is not self or not self._spreads:
+            return
+        if self._resize_after_id is not None:
+            self.after_cancel(self._resize_after_id)
+        self._resize_after_id = self.after(
+            150, lambda: self._show_spread(self._current)
+        )
+
+    # ------------------------------------------------------------------
+    # Page rendering helpers
+    # ------------------------------------------------------------------
+
+    def _page_to_pil(self, page_idx: int) -> Image.Image:
+        """
+        Render a single PDF page to a PIL Image at _RENDER_SCALE.
+
+        Forces RGB colorspace so the pixmap never has an alpha channel,
+        then constructs PIL Image directly from the raw sample buffer —
+        avoiding the PNG encode/decode round-trip of the old implementation.
+        """
+        mat = fitz.Matrix(self._RENDER_SCALE, self._RENDER_SCALE)
+        pix = self._doc[page_idx].get_pixmap(matrix=mat, colorspace=fitz.csRGB)
+        return Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+
+    def _fit_image(self, pil_img: Image.Image) -> Image.Image:
+        """
+        Downscale *pil_img* with LANCZOS resampling to fit within the
+        current image-label dimensions.  Never upscales — only shrinks.
+
+        Calls update_idletasks() first so winfo_width/height() return
+        the actual rendered size rather than 1 (unrealized widget).
+        """
+        self.update_idletasks()
+        max_w = max(self._image_label.winfo_width()  - 8, 100)
+        max_h = max(self._image_label.winfo_height() - 8, 80)
+
+        img_w, img_h = pil_img.size
+        scale = min(max_w / img_w, max_h / img_h, 1.0)   # 1.0 = never upscale
+
+        new_w = max(1, int(img_w * scale))
+        new_h = max(1, int(img_h * scale))
+
+        if (new_w, new_h) == (img_w, img_h):
+            return pil_img
+        return pil_img.resize((new_w, new_h), Image.LANCZOS)
 
     # ------------------------------------------------------------------
     # Spread rendering
@@ -450,88 +526,80 @@ class PreviewDialog(ctk.CTkToplevel):
     def _show_spread(self, idx: int) -> None:
         """
         Render spread at position *idx* and update the image label,
-        info text, counter, and window geometry.
+        info text, counter, and nav buttons.
+
+        Pages are rendered at _RENDER_SCALE then downscaled to fit the
+        available label area, so the preview always fills the window
+        and updates correctly on resize.
         """
-        self._current  = idx
-        spread         = self._spreads[idx]
-        left_page_idx, right_page_idx = spread   # right may be None
+        if self._doc is None:
+            return
 
-        mat = fitz.Matrix(self._SCALE, self._SCALE)
-
-        def _page_to_pil(page_idx: int) -> Image.Image:
-            pix = self._doc[page_idx].get_pixmap(matrix=mat)
-            return Image.open(io.BytesIO(pix.tobytes("png")))
+        self._current          = idx
+        left_page_idx, right_page_idx = self._spreads[idx]
 
         if right_page_idx is not None:
             # ---- Two-page spread (respect Eastern / Western order) ----
             if self._manga_mode:
-                # Eastern: right-to-left — the higher page index appears
-                # on the visual LEFT of the spread
-                pil_left  = _page_to_pil(right_page_idx)
-                pil_right = _page_to_pil(left_page_idx)
+                # Eastern: right-to-left — higher page index on visual LEFT
+                pil_left        = self._page_to_pil(right_page_idx)
+                pil_right       = self._page_to_pil(left_page_idx)
                 label_left_num  = right_page_idx + 1
                 label_right_num = left_page_idx  + 1
-                mode_str = "Eastern  (right-to-left)"
+                mode_str        = "Eastern  (right-to-left)"
             else:
-                pil_left  = _page_to_pil(left_page_idx)
-                pil_right = _page_to_pil(right_page_idx)
+                pil_left        = self._page_to_pil(left_page_idx)
+                pil_right       = self._page_to_pil(right_page_idx)
                 label_left_num  = left_page_idx  + 1
                 label_right_num = right_page_idx + 1
-                mode_str = "Western  (left-to-right)"
+                mode_str        = "Western  (left-to-right)"
 
-            # Combine both thumbnails into one PIL image side-by-side
-            combined_w = pil_left.width + pil_right.width + 4  # 4px separator
+            sep_w      = 4
+            combined_w = pil_left.width + sep_w + pil_right.width
             combined_h = max(pil_left.height, pil_right.height)
             canvas     = Image.new("RGB", (combined_w, combined_h), (59, 142, 208))
             canvas.paste(pil_left,  (0, 0))
-            canvas.paste(pil_right, (pil_left.width + 4, 0))
+            canvas.paste(pil_right, (pil_left.width + sep_w, 0))
 
+            fitted  = self._fit_image(canvas)
             ctk_img = ctk.CTkImage(
-                light_image=canvas, dark_image=canvas,
-                size=(combined_w, combined_h),
+                light_image=fitted, dark_image=fitted,
+                size=(fitted.width, fitted.height),
             )
             info = (
                 f"Mode: {mode_str}    "
                 f"Page {label_left_num}  |  Page {label_right_num}"
             )
-            geom_w = combined_w + 40
-            geom_h = combined_h + 110
 
         else:
             # ---- Single page ------------------------------------------
-            pil_single = _page_to_pil(left_page_idx)
+            pil_single = self._page_to_pil(left_page_idx)
+            fitted     = self._fit_image(pil_single)
             ctk_img    = ctk.CTkImage(
-                light_image=pil_single, dark_image=pil_single,
-                size=(pil_single.width, pil_single.height),
+                light_image=fitted, dark_image=fitted,
+                size=(fitted.width, fitted.height),
             )
-            info    = f"Single page  (page {left_page_idx + 1})"
-            geom_w  = pil_single.width + 40
-            geom_h  = pil_single.height + 110
+            info = f"Single page  (page {left_page_idx + 1})"
 
-        # Keep a reference so the garbage collector does not drop the image
-        self._image_ref = ctk_img
+        self._image_ref = ctk_img   # keep reference so GC does not drop it
 
-        # Update the image, info text, counter, and nav buttons
         self._image_label.configure(image=ctk_img, text="")
         self._info_label.configure(text=info)
-        self._counter_label.configure(
-            text=f"{idx + 1} / {len(self._spreads)}"
-        )
-        self._btn_prev.configure(state="normal" if idx > 0 else "disabled")
-        self._btn_next.configure(
-            state="normal" if idx < len(self._spreads) - 1 else "disabled"
-        )
-
-        # Clamp geometry to a reasonable maximum so large PDFs don't overflow
-        max_w, max_h = 1200, 900
-        self.geometry(f"{min(geom_w, max_w)}x{min(geom_h, max_h)}")
+        self._counter_label.configure(text=f"{idx + 1} / {len(self._spreads)}")
+        self._btn_prev.configure(state="normal" if idx > 0                      else "disabled")
+        self._btn_next.configure(state="normal" if idx < len(self._spreads) - 1 else "disabled")
 
     # ------------------------------------------------------------------
     # Cleanup
     # ------------------------------------------------------------------
 
     def destroy(self) -> None:
-        """Close the fitz document before destroying the window."""
+        """Cancel any pending resize callback and close the fitz document."""
+        if self._resize_after_id is not None:
+            try:
+                self.after_cancel(self._resize_after_id)
+            except Exception:
+                pass
         if self._doc is not None:
             try:
                 self._doc.close()
@@ -902,7 +970,6 @@ class PDFPageMergerGUI(ctk.CTk, TkinterDnD.DnDWrapper):
                 system = platform.system()
 
                 if system == "Windows":
-                    
                     ico_path = Path(__file__).parent.parent / "img" / "icon.ico"
                     if ico_path.exists():
                         # Imposta un AppUserModelID univoco — necessario per la taskbar
@@ -930,12 +997,10 @@ class PDFPageMergerGUI(ctk.CTk, TkinterDnD.DnDWrapper):
                 elif system == "Darwin":
                     icns_path = Path(__file__).parent.parent / "img" / "icon.icns"
                     if icns_path.exists():
-                        # macOS: usa osascript per impostare l'icona del dock
                         subprocess.Popen([
                             "osascript", "-e",
                             f'tell application "System Events" to set the icon of process "Python" to POSIX file "{icns_path}"'
                         ])
-                    # iconphoto funziona comunque come fallback nella titlebar
                     from PIL import ImageTk
                     self._tk_icon = ImageTk.PhotoImage(icon_img.resize((64, 64)))
                     self.iconphoto(True, self._tk_icon)
@@ -1110,8 +1175,14 @@ class PDFPageMergerGUI(ctk.CTk, TkinterDnD.DnDWrapper):
             self.drop_frame,
             text="Drop PDF files here  •  Multiple files supported",
         ).pack(expand=True)
-        self.drop_frame.drop_target_register(DND_FILES)
-        self.drop_frame.dnd_bind("<<Drop>>", self._on_drop)
+        try:
+            self.drop_frame.drop_target_register(DND_FILES)
+            self.drop_frame.dnd_bind("<<Drop>>", self._on_drop)
+            self._dnd_available = True
+        except Exception:
+            # tkdnd not available on this system — drag-and-drop is disabled
+            # but the rest of the UI (Browse button, etc.) still works normally.
+            self._dnd_available = False
 
         ctk.CTkButton(
             self, text="Browse Files", command=self._browse_files,
@@ -1158,9 +1229,58 @@ class PDFPageMergerGUI(ctk.CTk, TkinterDnD.DnDWrapper):
     # ============================================================
 
     def _browse_files(self) -> None:
-        paths = ctk.filedialog.askopenfilenames(
-            filetypes=[("PDF Files", "*.pdf")]
-        )
+        paths: list[str] = []
+
+        if platform.system() == "Linux":
+            try:
+                result = subprocess.run(
+                    [
+                        "zenity", "--file-selection",
+                        "--multiple",
+                        "--file-filter=PDF files (*.pdf) | *.pdf",
+                        "--title=Select PDF files",
+                    ],
+                    capture_output=True, text=True, timeout=60,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    paths = [
+                        p for p in result.stdout.strip().split("|")
+                        if p.lower().endswith(".pdf")
+                    ]
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                pass
+
+            if not paths:
+                try:
+                    result = subprocess.run(
+                        [
+                            "kdialog", "--getopenfilenames",
+                            Path.home().as_posix(),
+                            "*.pdf",
+                            "--title", "Select PDF files",
+                        ],
+                        capture_output=True, text=True, timeout=60,
+                    )
+                    if result.returncode == 0 and result.stdout.strip():
+                        paths = [
+                            p for p in result.stdout.strip().split()
+                            if p.lower().endswith(".pdf")
+                        ]
+                except (FileNotFoundError, subprocess.TimeoutExpired):
+                    pass
+
+        if not paths:
+            # Forza il focus sulla finestra prima di aprire il dialog
+            self.lift()
+            self.focus_force()
+            self.update()
+            selected = ctk.filedialog.askopenfilenames(
+                parent=self,
+                title="Select PDF files",
+                filetypes=[("PDF Files", "*.pdf")],
+            )
+            paths = list(selected)
+
         for p in paths:
             self._add_pdf(p)
 
